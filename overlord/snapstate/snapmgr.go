@@ -24,19 +24,27 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/tomb.v2"
 
 	"github.com/snapcore/snapd/boot"
+	"github.com/snapcore/snapd/errtracker"
 	"github.com/snapcore/snapd/i18n"
 	"github.com/snapcore/snapd/logger"
+	"github.com/snapcore/snapd/osutil"
 	"github.com/snapcore/snapd/overlord/auth"
 	"github.com/snapcore/snapd/overlord/snapstate/backend"
 	"github.com/snapcore/snapd/overlord/state"
 	"github.com/snapcore/snapd/release"
 	"github.com/snapcore/snapd/snap"
 	"github.com/snapcore/snapd/store"
+)
+
+var (
+	errtrackerReport = errtracker.Report
 )
 
 // SnapManager is responsible for the installation and removal of snaps.
@@ -410,6 +418,25 @@ func (m *SnapManager) ensureUbuntuCoreTransition() error {
 		}
 	}
 
+	// ensure we limit the retries in case something goes wrong
+	var lastUbuntuCoreTransitionAttempt time.Time
+	err = m.state.Get("ubuntu-core-transition-last-retry-time", &lastUbuntuCoreTransitionAttempt)
+	if err != nil && err != state.ErrNoState {
+		return err
+	}
+	now := time.Now()
+	if !lastUbuntuCoreTransitionAttempt.IsZero() && lastUbuntuCoreTransitionAttempt.Add(6*time.Hour).After(now) {
+		return nil
+	}
+	m.state.Set("ubuntu-core-transition-last-retry-time", now)
+
+	var retryCount int
+	err = m.state.Get("ubuntu-core-transition-retry", &retryCount)
+	if err != nil && err != state.ErrNoState {
+		return err
+	}
+	m.state.Set("ubuntu-core-transition-retry", retryCount+1)
+
 	tss, err := TransitionCore(m.state, "ubuntu-core", "core")
 	if err != nil {
 		return err
@@ -426,7 +453,6 @@ func (m *SnapManager) ensureUbuntuCoreTransition() error {
 
 // Ensure implements StateManager.Ensure.
 func (m *SnapManager) Ensure() error {
-	// do not exit right away on error
 	err := m.ensureUbuntuCoreTransition()
 
 	m.runner.Ensure()
@@ -512,7 +538,75 @@ func (m *SnapManager) doPrepareSnap(t *state.Task, _ *tomb.Tomb) error {
 }
 
 func (m *SnapManager) undoPrepareSnap(t *state.Task, _ *tomb.Tomb) error {
-	// FIXME: remove the entire function
+	st := t.State()
+	st.Lock()
+	defer st.Unlock()
+
+	snapsup, err := TaskSnapSetup(t)
+	if err != nil {
+		return err
+	}
+
+	// report this error to an error tracker
+	if osutil.GetenvBool("SNAPPY_TESTING") {
+		return nil
+	}
+	if snapsup.SideInfo == nil || snapsup.SideInfo.RealName == "" {
+		return nil
+	}
+
+	var logMsg []string
+	var snapSetup string
+	dupSig := []string{"snap-install:"}
+	for _, t := range t.Change().Tasks() {
+		// TODO: report only tasks in intersecting lanes?
+		tintro := fmt.Sprintf("%s: %s", t.Kind(), t.Status())
+		logMsg = append(logMsg, tintro)
+		dupSig = append(dupSig, tintro)
+		if snapsup, err := TaskSnapSetup(t); err == nil && snapsup.SideInfo != nil {
+			snapSetup1 := fmt.Sprintf(" snap-setup: %q (%v) %q", snapsup.SideInfo.RealName, snapsup.SideInfo.Revision, snapsup.SideInfo.Channel)
+			if snapSetup1 != snapSetup {
+				snapSetup = snapSetup1
+				logMsg = append(logMsg, snapSetup)
+				dupSig = append(dupSig, fmt.Sprintf(" snap-setup: %q", snapsup.SideInfo.RealName))
+			}
+		}
+		for _, l := range t.Log() {
+			// cut of the rfc339 timestamp to ensure duplicate
+			// detection works in daisy
+			tStampLen := strings.Index(l, " ")
+			if tStampLen < 0 {
+				continue
+			}
+			// not tStampLen+1 because the indent is nice
+			entry := l[tStampLen:]
+			logMsg = append(logMsg, entry)
+			dupSig = append(dupSig, entry)
+		}
+	}
+
+	var ubuntuCoreTransitionCount int
+	err = st.Get("ubuntu-core-transition-retry", &ubuntuCoreTransitionCount)
+	if err != nil && err != state.ErrNoState {
+		return err
+	}
+	extra := map[string]string{
+		"Channel":  snapsup.Channel,
+		"Revision": snapsup.SideInfo.Revision.String(),
+	}
+	if ubuntuCoreTransitionCount > 0 {
+		extra["UbuntuCoreTransitionCount"] = strconv.Itoa(ubuntuCoreTransitionCount)
+	}
+
+	st.Unlock()
+	oopsid, err := errtrackerReport(snapsup.SideInfo.RealName, strings.Join(logMsg, "\n"), strings.Join(dupSig, "\n"), extra)
+	st.Lock()
+	if err == nil {
+		logger.Noticef("Reported problem as %s", oopsid)
+	} else {
+		logger.Debugf("Cannot report problem: %s", err)
+	}
+
 	return nil
 }
 
