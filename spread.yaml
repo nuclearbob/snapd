@@ -31,6 +31,7 @@ environment:
     DELTA_PREFIX: snapd-$DELTA_REF/
     http_proxy: "$(HOST: echo $http_proxy)"
     https_proxy: "$(HOST: echo $https_proxy)"
+    no_proxy: "127.0.0.1"
 
 backends:
     linode:
